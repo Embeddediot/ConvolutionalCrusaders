@@ -1,2 +1,2 @@
-# convolutional-crusaders
+# ConvolutionalCrusaders
 We are doing fun deep learning
