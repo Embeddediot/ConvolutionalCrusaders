@@ -22,7 +22,7 @@ NUM_CLASSES = 10
 # batch size
 INIT_LR = 0.5e-3
 
-NUM_EPOCHS = 3
+NUM_EPOCHS = 50
 BATCH_SIZE = 16
 
 # define the input image dimensions

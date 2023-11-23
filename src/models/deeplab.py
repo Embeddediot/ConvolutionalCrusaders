@@ -1,75 +1,63 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 
-class AtrousSeparableConvolution(nn.Module):
-    """Atrous Separable Convolution"""
-
-    def __init__(self, in_channels, out_channels, kernel_size, stride, dilation, padding):
-        super(AtrousSeparableConvolution, self).__init__()
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, stride, padding=padding, dilation=dilation, groups=in_channels)
-        self.pointwise = nn.Conv2d(in_channels, out_channels, 1, 1, padding=0)
-
-    def forward(self, x):
-        return self.pointwise(F.relu(self.depthwise(x)))
-
-class DecoderBlock(nn.Module):
-    """Decoder block"""
-
-    def __init__(self, in_channels, out_channels, upsample_factor):
-        super(DecoderBlock, self).__init__()
-        self.atrous_separable_convolution_1 = AtrousSeparableConvolution(in_channels, in_channels // 2, 3, 1, dilation=2, padding=1)
-        self.atrous_separable_convolution_2 = AtrousSeparableConvolution(in_channels // 2, out_channels, 3, 1, dilation=4, padding=1)
-        self.upsample = nn.Upsample(scale_factor=upsample_factor)
+class ASPP(nn.Module):
+    def __init__(self, in_channels, out_channels=256, rates=[6, 12, 18, 24]):
+        super(ASPP, self).__init__()
+        self.conv1x1_1 = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.conv3x3_1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=rates[0], dilation=rates[0])
+        self.conv3x3_2 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=rates[1], dilation=rates[1])
+        self.conv3x3_3 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=rates[2], dilation=rates[2])
+        self.conv3x3_4 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=rates[3], dilation=rates[3])
 
     def forward(self, x):
-        x = self.atrous_separable_convolution_1(x)
-        x = self.atrous_separable_convolution_2(x)
-        return self.upsample(x)
+        conv1x1 = self.conv1x1_1(x)
+        conv3x3_1 = self.conv3x3_1(x)
+        conv3x3_2 = self.conv3x3_2(x)
+        conv3x3_3 = self.conv3x3_3(x)
+        conv3x3_4 = self.conv3x3_4(x)
 
-class DeepLabv3Plus(nn.Module):
-    """DeepLabv3+"""
+        out = torch.cat([conv1x1, conv3x3_1, conv3x3_2, conv3x3_3, conv3x3_4], dim=1)
 
-    def __init__(self, num_classes=21, backbone='resnet101'):
-        super(DeepLabv3Plus, self).__init__()
+        return out
 
-        # Load the encoder backbone
-        if backbone == 'resnet101':
-            self.encoder = ResNet101()
-        elif backbone == 'resnet50':
-            self.encoder = ResNet50()
-        else:
-            raise NotImplementedError(f'Backbone "{backbone}" is not supported.')
-
-        # Remove the last layer of the encoder
-        del self.encoder.fc
-
-        # Atrous Spatial Pyramid Pooling (ASPP)
-        self.aspp = nn.ModuleDict([
-            ('aspp_1', AtrousSeparableConvolution(2048, 256, 1, 1, dilation=1, padding=0)),
-            ('aspp_2', AtrousSeparableConvolution(2048, 256, 3, 1, dilation=6, padding=1)),
-            ('aspp_3', AtrousSeparableConvolution(2048, 256, 3, 1, dilation=12, padding=1)),
-            ('aspp_4', AtrousSeparableConvolution(2048, 256, 3, 1, dilation=24, padding=1)),
-        ])
-
-        # Decoder
-        self.decoder_block_1 = DecoderBlock(1280, 256, 2)
-        self.decoder_block_2 = DecoderBlock(512, 128, 2)
-        self.decoder_block_3 = DecoderBlock(256, 64, 2)
-        self.decoder_block_4 = DecoderBlock(64, 64, 1)
-
-        # Final classification layer
-        self.classifier = nn.Conv2d(64, num_classes, 1, 1, padding=0)
+class DeepLabV3Plus(nn.Module):
+    def __init__(self, in_channels, num_classes):
+        super(DeepLabV3Plus, self).__init__()
+        self.resnet_backbone = torchvision.models.resnet18(pretrained=True)
+        self.aspp = ASPP(in_channels=512, out_channels=256)  # Adjust in_channels based on the ResNet version
+        self.conv1x1 = nn.Conv2d(1280, 256, kernel_size=1)  # Adjust the number of input channels here
+        self.upsample = nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)
+        self.segmentation_head = nn.Conv2d(256, num_classes, kernel_size=1)
 
     def forward(self, x):
-        # Extract features from the encoder
-        features = self.encoder(x)
+        input_shape = x.shape[-2:]
+
+        # Encoder
+        x = self.resnet_backbone.conv1(x)
+        x = self.resnet_backbone.bn1(x)
+        x = self.resnet_backbone.relu(x)
+        x = self.resnet_backbone.maxpool(x)
+
+        x = self.resnet_backbone.layer1(x)
+        x = self.resnet_backbone.layer2(x)
+        x = self.resnet_backbone.layer3(x)
+        x = self.resnet_backbone.layer4(x)
 
         # ASPP
-        aspp_outputs = {}
-        for name, module in self.aspp.items():
-            aspp_outputs[name] = module(features['layer4'])
+        x = self.aspp(x)
 
-        # Concatenate ASPP outputs and pass them through a convolution
-        aspp_out = torch.cat([aspp_outputs[name] for name in self.aspp.keys()], dim=1)
-        aspp_out = nn.Conv2d(1024, 256, 1
+        # Global average pooling
+        x = F.adaptive_avg_pool2d(x, 1)
+        x = F.interpolate(x, size=input_shape, mode='bilinear', align_corners=False)
+
+        # Decoder
+        x = self.conv1x1(x)
+        x = self.upsample(x)
+
+        # Final segmentation head
+        x = self.segmentation_head(x)
+
+        return x
