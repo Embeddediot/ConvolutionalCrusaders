@@ -3,6 +3,7 @@ import logging
 import warnings
 import torch
 from tqdm import tqdm
+from segmentation_models_pytorch.metrics import iou_score, get_stats
 
 class Trainer:
     """Trainer
@@ -26,14 +27,23 @@ class Trainer:
     train_step_loss : list
     val_step_loss : list
     """
-    def __init__(self, model, criterion, optimizer, device):
+    def __init__(self, model, criterion1,criterion2, testLoader, optimizer, device, modelPath, alpha=0.6, beta=0.4):
         self.model = model
-        self.criterion = criterion
+        self.criterion1 = criterion1
+        self.criterion2 = criterion2
+        self.alpha = alpha
+        self.beta = beta
         self.optimizer = optimizer
         self.device = device
+        self.modelpath = modelPath
 
         # send model to device
         self.model.to(self.device)
+        
+        self.test_X = 0
+        self.test_Y = 0
+
+        self.IOU_score = []
 
         # attributes
         self.train_loss_ = []
@@ -41,6 +51,9 @@ class Trainer:
 
         self.train_step_loss = []
         self.val_step_loss = []
+
+        self.test_X , self.test_Y = next(iter(testLoader))
+        self.test_X , self.test_Y = self.test_X.to(self.device), self.test_Y.to(self.device)
 
         logging.basicConfig(level=logging.INFO)
 
@@ -66,6 +79,7 @@ class Trainer:
 
         best_val_loss = float('inf')
         patience_counter = 0
+        best_res_loss = 0
 
         print("Starting Training...")
         # ---- train process ----
@@ -77,17 +91,33 @@ class Trainer:
             tr_loss = self._train(train_loader,epoch)
 
             # validate
-            val_loss = self._validate(val_loader)
+            #val_loss = self._validate(val_loader)
+            val_loss = 0
 
             self.train_loss_.append(tr_loss)
-            self.val_loss_.append(val_loss)
+            #self.val_loss_.append(val_loss)
 
             epoch_time = time.time() - epoch_start_time
 
+            
+            # IOU score
+            IOUscore_ = self._test(self.model, self.test_X, self.test_Y)
+            self.IOU_score.append(IOUscore_.item())
+
+
+            # LOG
+            self._logger(tr_loss, val_loss, IOUscore_.item(), epoch + 1, epochs, epoch_time)
+
+            # save checkpoint
+            filename = 'c_{}_IOU_{:.4f}.pth.tar'
+            filename = self.modelpath + filename
+            filename = filename.format(epoch, IOUscore_)
+            torch.save(self.model.state_dict(), filename)
+
             # early stopping check
             if early_stopping:
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                if IOUscore_.item() > best_res_loss:
+                    best_res_loss = IOUscore_.item()
                     patience_counter = 0
                 else:
                     patience_counter += 1
@@ -95,13 +125,17 @@ class Trainer:
                 if patience_counter >= patience:
                     logging.info(f"Early stopping at epoch {epoch + 1} due to lack of improvement.")
                     break
-
-            self._logger(tr_loss, val_loss, epoch + 1, epochs, epoch_time)
+            
+            
 
         total_time = time.time() - total_start_time
 
         # final message
         logging.info(f"End of training. Total time: {round(total_time, 5)} seconds")
+
+        # Evalution graph
+
+
 
     def _train(self, loader, epoch):
         self.model.train()
@@ -149,15 +183,17 @@ class Trainer:
 
                 out = self.model(X)
                 loss = self._compute_loss(out, Y)
-
+                
                 #Log
                 self.val_step_loss.append(loss.cpu().detach().numpy())
-
+        
         return loss.item()
 
     def _compute_loss(self, real, target):
         try:
-            loss = self.criterion(real, target)
+            loss1 = self.criterion1(real, target)
+            loss2 = self.criterion2(real, target)
+            loss = loss1*self.alpha + loss2*self.beta
         except:
             loss = self.criterion(real, target.long())
             msg = f"Target tensor has been casted from"
@@ -168,10 +204,19 @@ class Trainer:
         
         return loss
 
-    def _logger(self, tr_loss, val_loss, epoch, epochs, epoch_time):
+    def _logger(self, tr_loss, val_loss, IOU, epoch, epochs, epoch_time):
         # to satisfy pep8 common limit of characters
         msg = f"Epoch {epoch}/{epochs} | Train loss: {tr_loss}"
         msg = f"{msg} | Validation loss: {val_loss}"
+        msg = f"{msg} | IOU score: {IOU}"
         msg = f"{msg} | Time/epoch: {round(epoch_time, 5)} seconds"
 
         logging.info(msg)
+
+    def _test(self, model, X, mask):
+        self.model.eval()
+        output = torch.argmax(model(X), dim=1) 
+
+        tp, fp, fn, tn = get_stats(output, mask, mode="multiclass",num_classes=10)
+        iou_res= iou_score(tp, fp, fn, tn, reduction="micro")
+        return iou_res
